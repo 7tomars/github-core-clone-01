@@ -328,8 +328,13 @@ export class Store {
     return seen;
   }
 
+  /** Memoized ancestor sets: history is immutable, so they never go stale. */
+  private ancestorsMemo = new Map<string, Set<string>>();
+
   /** Commit ancestors of a tip (inclusive), following first-and-all parents. */
   commitAncestors(tip: string): Set<string> {
+    const cached = this.ancestorsMemo.get(tip);
+    if (cached) return cached;
     const seen = new Set<string>();
     const stack = [tip];
     while (stack.length > 0) {
@@ -340,6 +345,7 @@ export class Store {
       seen.add(oid);
       for (const parent of parseCommit(object.data).parents) stack.push(parent);
     }
+    if (this.ancestorsMemo.size < 8192) this.ancestorsMemo.set(tip, seen);
     return seen;
   }
 
@@ -603,11 +609,10 @@ export function readPack(store: Store, pack: Buffer): PackEntry[] {
 
 /** The compressed length of the zlib stream starting at `start` (found by inflating). */
 function compressedLength(pack: Buffer, start: number, expectedPlain: number): number {
-  // inflateSync consumes a whole buffer; find the stream end by trying the trailer:
-  // zlib streams are self-terminating, and Node reports bytes read only via streaming API.
-  // The pack sizes here are small, so binary-search the shortest prefix that inflates.
-  let lo = 1;
-  let hi = pack.length - start;
+  // inflateSync ignores trailing bytes but throws on a truncated stream, so the
+  // stream's exact length is the shortest prefix that inflates to the full output.
+  // Bracket it exponentially from a size guess, then binary-search inside.
+  const remaining = pack.length - start;
   const ok = (length: number): boolean => {
     try {
       return inflateSync(pack.subarray(start, start + length)).length === expectedPlain;
@@ -615,6 +620,13 @@ function compressedLength(pack: Buffer, start: number, expectedPlain: number): n
       return false;
     }
   };
+  let hi = Math.min(remaining, Math.max(64, expectedPlain + 16));
+  let lo = 1;
+  while (!ok(hi)) {
+    lo = hi + 1;
+    if (hi >= remaining) break;
+    hi = Math.min(remaining, hi * 2);
+  }
   while (lo < hi) {
     const mid = Math.floor((lo + hi) / 2);
     if (ok(mid)) hi = mid;

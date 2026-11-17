@@ -171,8 +171,9 @@ export function planFetch(store: Store, args: FetchArgs): FetchPlan {
         queue.push([commit, 0]);
       }
     }
-    while (queue.length > 0) {
-      const [oid, depth] = queue.shift()!;
+    let queueHead = 0;
+    while (queueHead < queue.length) {
+      const [oid, depth] = queue[queueHead++]!;
       const object = store.objects.get(oid);
       if (!object || object.type !== 'commit') continue;
       for (const parent of parseCommit(object.data).parents) {
@@ -196,7 +197,30 @@ export function planFetch(store: Store, args: FetchArgs): FetchPlan {
   // already holds (its shallow boundary treated as parentless) stays on the
   // client. Commits beyond a depth cut are NOT excluded — their objects are
   // still sent whenever a sent commit's tree reaches them (shared blobs).
-  const excluded = store.reachable([...haveCommits]);
+  // The exclusion closure is bounded by the client's shallow list: a commit the
+  // client holds shallowly does not put its ancestors (or their trees) on the
+  // client, so those objects are never excluded.
+  const excluded = new Set<string>();
+  {
+    const stack = [...haveCommits];
+    const seenCommits = new Set<string>();
+    while (stack.length > 0) {
+      const oid = stack.pop()!;
+      const object = store.objects.get(oid);
+      if (!object) continue;
+      if (object.type === 'commit') {
+        if (seenCommits.has(oid)) continue;
+        seenCommits.add(oid);
+        excluded.add(oid);
+        const view = parseCommit(object.data);
+        for (const entry of store.reachable([view.tree])) excluded.add(entry);
+        if (clientShallow.has(oid)) continue;
+        for (const parent of view.parents) stack.push(parent);
+      } else {
+        for (const entry of store.reachable([oid])) excluded.add(entry);
+      }
+    }
+  }
   // The send set: every sent commit plus its full tree closure, plus any
   // non-commit want (a tag object rides along and points at its commit).
   // Parent commits outside the sent set are never walked into.

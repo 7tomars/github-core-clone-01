@@ -46,7 +46,8 @@ logical clock seeded by `MAKEFUN_TRIAL_NOW`, so replays are byte-identical.
 ## Layout
 
 - `main.ts` — the lifecycle (register, poll done, exit).
-- `app.ts` — HTTP routing, auth, and the cross-cutting wire rules.
+- `app.ts` — a hand-rolled HTTP/1.1 server on `node:net` (one buffer in, one
+  buffer out), routing, auth, and the cross-cutting wire rules.
 - `core.ts` — the store and the git object engine (hashing, trees, packs, pkt-lines).
 - `git.ts` — smart HTTP: advertisements, ls-refs, fetch planning, receive-pack.
 - `rest.ts` — the REST v3 resources, contents commits, PR diffs and merges.

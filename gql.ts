@@ -816,6 +816,7 @@ function resolveMutation(ctx: Ctx, _node: Node, field: FieldNode): unknown {
         comments: [],
         createdAt: store.nowIso(),
         isPull: false,
+        rev: 0,
       };
       repo.nextNumber += 1;
       repo.issues.set(issue.number, issue);
@@ -838,6 +839,7 @@ function resolveMutation(ctx: Ctx, _node: Node, field: FieldNode): unknown {
         return null;
       }
       found.issue.state = 'closed';
+      found.issue.rev += 1;
       if (field.selection === null) return {};
       const out: Obj = {};
       for (const item of field.selection) {
@@ -915,6 +917,7 @@ function resolveMutation(ctx: Ctx, _node: Node, field: FieldNode): unknown {
         createdAt: store.nowIso(),
       };
       found.issue.comments.push(comment);
+      found.issue.rev += 1;
       const commentNode = plainNode('IssueComment', {
         id: gid('IssueComment', comment.id),
         body: comment.body,

@@ -114,6 +114,7 @@ const TOOLS: Tool[] = [
         comments: [],
         createdAt: store.nowIso(),
         isPull: false as const,
+        rev: 0,
       };
       repo.nextNumber += 1;
       repo.issues.set(issue.number, issue);

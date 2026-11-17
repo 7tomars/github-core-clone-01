@@ -22,7 +22,11 @@ export interface RestReply {
   body: unknown;
   headers?: Record<string, string>;
   rawText?: string;
+  contentType?: string;
 }
+
+/** Serialized GET-one-issue bodies, keyed by the issue's mutation counter. */
+const issueBodyCache = new WeakMap<Repo, Map<number, { rev: number; owner: string; text: string }>>();
 
 const NOT_FOUND: RestReply = { status: 404, body: { message: 'Not Found' } };
 
@@ -149,8 +153,7 @@ function putFile(
   const files = parent !== null ? store.filesOfCommit(parent) : new Map<string, Buffer>();
   files.set(path, data);
   const commitSha = store.commitFiles(parent, files, message, authorLine(store));
-  repo.refs.set(branchRef, commitSha);
-  repo.packCache.clear();
+  store.setRef(repo, branchRef, commitSha);
   const blobSha = store.hashOfBlob(data);
   return { commitSha, contentSha: blobSha };
 }
@@ -168,8 +171,7 @@ function deleteFile(
   if (!files.has(path)) return null;
   files.delete(path);
   const commitSha = store.commitFiles(parent, files, message, authorLine(store));
-  repo.refs.set(branchRef, commitSha);
-  repo.packCache.clear();
+  store.setRef(repo, branchRef, commitSha);
   return commitSha;
 }
 
@@ -271,8 +273,7 @@ export function squashMerge(store: Store, repo: Repo, pull: Pull): string {
   const message = `${pull.title}\n\nSquash merge of #${pull.number} from ${pull.headRef}`;
   const data = Buffer.from(`${lines.join('\n')}\n\n${message}`, 'utf8');
   const commitSha = store.putObject('commit', data);
-  repo.refs.set(`refs/heads/${pull.baseRef}`, commitSha);
-  repo.packCache.clear();
+  store.setRef(repo, `refs/heads/${pull.baseRef}`, commitSha);
   return commitSha;
 }
 
@@ -384,8 +385,7 @@ function handleRepo(store: Store, req: RestRequest, repo: Repo, owner: string, r
       const ref = typeof body.ref === 'string' ? body.ref : '';
       const sha = typeof body.sha === 'string' ? body.sha : '';
       if (!ref.startsWith('refs/') || !store.objects.has(sha)) return err(422, 'Validation Failed');
-      repo.refs.set(ref, sha);
-      repo.packCache.clear();
+      store.setRef(repo, ref, sha);
       return { status: 201, body: { ref, object: { sha, type: 'commit' } } };
     }
     if (rest.length >= 3 && method === 'GET') {
@@ -579,6 +579,7 @@ function handleIssues(store: Store, req: RestRequest, repo: Repo, owner: string,
         comments: [],
         createdAt: store.nowIso(),
         isPull: false,
+        rev: 0,
       };
       repo.nextNumber += 1;
       repo.issues.set(issue.number, issue);
@@ -600,12 +601,26 @@ function handleIssues(store: Store, req: RestRequest, repo: Repo, owner: string,
   const issue = Number.isFinite(number) ? repo.issues.get(number) : undefined;
   if (rest.length === 2) {
     if (issue === undefined) return NOT_FOUND;
-    if (method === 'GET') return { status: 200, body: issueJson(issue, repo, owner) };
+    if (method === 'GET') {
+      let perRepo = issueBodyCache.get(repo);
+      const hit = perRepo?.get(number);
+      if (hit && hit.rev === issue.rev && hit.owner === owner) {
+        return { status: 200, body: null, rawText: hit.text, contentType: 'application/json; charset=utf-8' };
+      }
+      const text = JSON.stringify(issueJson(issue, repo, owner));
+      if (!perRepo) {
+        perRepo = new Map();
+        issueBodyCache.set(repo, perRepo);
+      }
+      perRepo.set(number, { rev: issue.rev, owner, text });
+      return { status: 200, body: null, rawText: text, contentType: 'application/json; charset=utf-8' };
+    }
     if (method === 'PATCH') {
       const body = (req.body ?? {}) as Record<string, unknown>;
       if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
       if (typeof body.title === 'string') issue.title = body.title;
       if (typeof body.body === 'string') issue.body = body.body;
+      issue.rev += 1;
       return { status: 200, body: issueJson(issue, repo, owner) };
     }
     return err(405, 'Method Not Allowed');
@@ -616,6 +631,7 @@ function handleIssues(store: Store, req: RestRequest, repo: Repo, owner: string,
       const body = (req.body ?? {}) as Record<string, unknown>;
       const comment = { id: store.nextComment(), body: typeof body.body === 'string' ? body.body : '', createdAt: store.nowIso() };
       issue.comments.push(comment);
+      issue.rev += 1;
       return { status: 201, body: { id: comment.id, body: comment.body, created_at: comment.createdAt, user: { login: owner } } };
     }
     if (method === 'GET') {

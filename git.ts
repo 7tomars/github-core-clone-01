@@ -53,7 +53,22 @@ function peelOf(store: Store, oid: string): string | null {
   return null;
 }
 
+/** Advertisement and ls-refs replies are pure functions of the ref state:
+ *  cache them per refsVersion (bounded, cleared wholesale when full). */
+const advCache = new Map<string, GitReply>();
+const lsRefsCache = new Map<string, Buffer>();
+
 export function advertise(store: Store, repo: Repo, service: string, version2: boolean): GitReply {
+  const cacheKey = `${repo.id}:${repo.refsVersion}:${repo.headRef}:${service}:${version2 ? 2 : 0}`;
+  const cachedReply = advCache.get(cacheKey);
+  if (cachedReply) return cachedReply;
+  const reply = advertiseFresh(store, repo, service, version2);
+  if (advCache.size > 256) advCache.clear();
+  advCache.set(cacheKey, reply);
+  return reply;
+}
+
+function advertiseFresh(store: Store, repo: Repo, service: string, version2: boolean): GitReply {
   if (service === 'git-upload-pack' && version2) {
     const lines = [
       'version 2',
@@ -100,6 +115,16 @@ interface LsRefsArgs {
 }
 
 export function lsRefs(store: Store, repo: Repo, args: LsRefsArgs): Buffer {
+  const cacheKey = `${repo.id}:${repo.refsVersion}:${repo.headRef}:${args.peel ? 1 : 0}${args.symrefs ? 1 : 0}:${args.prefixes.join(',')}`;
+  const cachedReply = lsRefsCache.get(cacheKey);
+  if (cachedReply) return cachedReply;
+  const reply = lsRefsFresh(store, repo, args);
+  if (lsRefsCache.size > 256) lsRefsCache.clear();
+  lsRefsCache.set(cacheKey, reply);
+  return reply;
+}
+
+function lsRefsFresh(store: Store, repo: Repo, args: LsRefsArgs): Buffer {
   const matches = (name: string): boolean =>
     args.prefixes.length === 0 || args.prefixes.some((prefix) => name.startsWith(prefix));
   const lines: string[] = [];
@@ -153,11 +178,11 @@ export function planFetch(store: Store, args: FetchArgs): FetchPlan {
     while (stack.length > 0) {
       const oid = stack.pop()!;
       if (haveCommits.has(oid)) continue;
-      const object = store.objects.get(oid);
-      if (!object || object.type !== 'commit') continue;
+      const view = store.commitOf(oid);
+      if (!view) continue;
       haveCommits.add(oid);
       if (clientShallow.has(oid)) continue;
-      for (const parent of parseCommit(object.data).parents) stack.push(parent);
+      for (const parent of view.parents) stack.push(parent);
     }
   }
   // Generation distance of every commit from the wants (BFS over parents).
@@ -174,9 +199,9 @@ export function planFetch(store: Store, args: FetchArgs): FetchPlan {
     let queueHead = 0;
     while (queueHead < queue.length) {
       const [oid, depth] = queue[queueHead++]!;
-      const object = store.objects.get(oid);
-      if (!object || object.type !== 'commit') continue;
-      for (const parent of parseCommit(object.data).parents) {
+      const view = store.commitOf(oid);
+      if (!view) continue;
+      for (const parent of view.parents) {
         if (!dist.has(parent)) {
           dist.set(parent, depth + 1);
           queue.push([parent, depth + 1]);
@@ -212,7 +237,7 @@ export function planFetch(store: Store, args: FetchArgs): FetchPlan {
         if (seenCommits.has(oid)) continue;
         seenCommits.add(oid);
         excluded.add(oid);
-        const view = parseCommit(object.data);
+        const view = store.commitOf(oid)!;
         for (const entry of store.reachable([view.tree])) excluded.add(entry);
         if (clientShallow.has(oid)) continue;
         for (const parent of view.parents) stack.push(parent);
@@ -241,10 +266,10 @@ export function planFetch(store: Store, args: FetchArgs): FetchPlan {
   const addCommit = (oid: string): void => {
     if (!sentCommits.has(oid)) return;
     if (send.has(oid)) return;
-    const object = store.objects.get(oid);
-    if (!object || object.type !== 'commit') return;
+    const view = store.commitOf(oid);
+    if (!view) return;
     send.add(oid);
-    addTreeClosure(parseCommit(object.data).tree);
+    addTreeClosure(view.tree);
   };
   for (const oid of sentCommits) addCommit(oid);
   for (const want of args.wants) {
@@ -271,10 +296,9 @@ export function planFetch(store: Store, args: FetchArgs): FetchPlan {
   const unshallowLines: string[] = [];
   if (depth !== null) {
     for (const oid of sentCommits) {
-      const object = store.objects.get(oid);
-      if (!object || object.type !== 'commit') continue;
-      const parents = parseCommit(object.data).parents;
-      const cut = parents.some((parent) => !sentCommits.has(parent));
+      const view = store.commitOf(oid);
+      if (!view) continue;
+      const cut = view.parents.some((parent) => !sentCommits.has(parent));
       if (cut) shallowLines.push(oid);
       else if (clientShallow.has(oid)) unshallowLines.push(oid);
     }
@@ -290,9 +314,7 @@ export function planFetch(store: Store, args: FetchArgs): FetchPlan {
 }
 
 function parseTreeEntries(store: Store, treeOid: string): string[] {
-  const object = store.objects.get(treeOid);
-  if (!object || object.type !== 'tree') return [];
-  return parseTree(object.data).map((entry) => entry.oid);
+  return store.treeOf(treeOid).map((entry) => entry.oid);
 }
 
 function peelToCommitLocal(store: Store, oid: string): string | null {
@@ -530,8 +552,7 @@ function applyCommand(store: Store, repo: Repo, command: PushCommand): string | 
   const current = repo.refs.get(ref) ?? ZERO_OID;
   if (current !== oldOid) return 'reference was changed in the meantime';
   if (newOid === ZERO_OID) {
-    repo.refs.delete(ref);
-    repo.packCache.clear();
+    store.deleteRef(repo, ref);
     return null;
   }
   const target = store.objects.get(newOid);
@@ -544,7 +565,6 @@ function applyCommand(store: Store, repo: Repo, command: PushCommand): string | 
       if (!store.isAncestor(oldCommit, newCommit)) return 'non-fast-forward';
     }
   }
-  repo.refs.set(ref, newOid);
-  if (ref === repo.headRef || ref.startsWith('refs/heads/')) repo.packCache.clear();
+  store.setRef(repo, ref, newOid);
   return null;
 }

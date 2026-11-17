@@ -136,6 +136,8 @@ export interface Issue {
   comments: Comment[];
   createdAt: string;
   isPull: false;
+  /** bumped on every mutation; keys the REST response cache */
+  rev: number;
 }
 
 export interface Pull {
@@ -166,6 +168,8 @@ export interface Repo {
   nextNumber: number;
   /** cached packfile bytes for shallow clones, keyed by tip oid */
   packCache: Map<string, Buffer>;
+  /** bumped on every ref change; keys the advertisement / ls-refs caches */
+  refsVersion: number;
 }
 
 export class Store {
@@ -217,6 +221,7 @@ export class Store {
       pulls: new Map(),
       nextNumber: 1,
       packCache: new Map(),
+      refsVersion: 0,
     };
     this.nextRepoId += 1;
     this.repos.set(name, repo);
@@ -227,6 +232,45 @@ export class Store {
     const id = this.nextCommentId;
     this.nextCommentId += 1;
     return id;
+  }
+
+  /** The one place refs change: bumps the version and drops cached packs. */
+  setRef(repo: Repo, ref: string, oid: string): void {
+    repo.refs.set(ref, oid);
+    repo.refsVersion += 1;
+    repo.packCache.clear();
+  }
+
+  deleteRef(repo: Repo, ref: string): void {
+    repo.refs.delete(ref);
+    repo.refsVersion += 1;
+    repo.packCache.clear();
+  }
+
+  /** Parsed views of immutable objects, memoized (bounded). */
+  private commitMemo = new Map<string, CommitView>();
+  private treeMemo = new Map<string, TreeEntry[]>();
+
+  commitOf(oid: string): CommitView | null {
+    const cached = this.commitMemo.get(oid);
+    if (cached) return cached;
+    const object = this.objects.get(oid);
+    if (!object || object.type !== 'commit') return null;
+    const view = parseCommit(object.data);
+    if (this.commitMemo.size > 32768) this.commitMemo.clear();
+    this.commitMemo.set(oid, view);
+    return view;
+  }
+
+  treeOf(oid: string): TreeEntry[] {
+    const cached = this.treeMemo.get(oid);
+    if (cached) return cached;
+    const object = this.objects.get(oid);
+    if (!object || object.type !== 'tree') return [];
+    const entries = parseTree(object.data);
+    if (this.treeMemo.size > 32768) this.treeMemo.clear();
+    this.treeMemo.set(oid, entries);
+    return entries;
   }
 
   putObject(type: ObjType, data: Buffer): string {
@@ -283,9 +327,7 @@ export class Store {
 
   /** The flat path->blob-oid map of a commit's tree (recursive). */
   flattenTree(treeOid: string, prefix = '', out = new Map<string, string>()): Map<string, string> {
-    const object = this.objects.get(treeOid);
-    if (!object || object.type !== 'tree') return out;
-    for (const entry of parseTree(object.data)) {
+    for (const entry of this.treeOf(treeOid)) {
       if (entry.mode === '40000') this.flattenTree(entry.oid, `${prefix}${entry.name}/`, out);
       else out.set(`${prefix}${entry.name}`, entry.oid);
     }
@@ -294,9 +336,9 @@ export class Store {
 
   filesOfCommit(commitOid: string): Map<string, Buffer> {
     const files = new Map<string, Buffer>();
-    const commit = this.objects.get(commitOid);
-    if (!commit || commit.type !== 'commit') return files;
-    const flat = this.flattenTree(parseCommit(commit.data).tree);
+    const view = this.commitOf(commitOid);
+    if (!view) return files;
+    const flat = this.flattenTree(view.tree);
     for (const [path, oid] of flat) {
       const blob = this.objects.get(oid);
       if (blob) files.set(path, blob.data);
@@ -316,11 +358,11 @@ export class Store {
       if (!object) continue;
       seen.add(oid);
       if (object.type === 'commit') {
-        const view = parseCommit(object.data);
+        const view = this.commitOf(oid)!;
         stack.push(view.tree);
         for (const parent of view.parents) stack.push(parent);
       } else if (object.type === 'tree') {
-        for (const entry of parseTree(object.data)) stack.push(entry.oid);
+        for (const entry of this.treeOf(oid)) stack.push(entry.oid);
       } else if (object.type === 'tag') {
         stack.push(parseTagTarget(object.data).object);
       }
@@ -340,10 +382,10 @@ export class Store {
     while (stack.length > 0) {
       const oid = stack.pop()!;
       if (seen.has(oid)) continue;
-      const object = this.objects.get(oid);
-      if (!object || object.type !== 'commit') continue;
+      const view = this.commitOf(oid);
+      if (!view) continue;
       seen.add(oid);
-      for (const parent of parseCommit(object.data).parents) stack.push(parent);
+      for (const parent of view.parents) stack.push(parent);
     }
     if (this.ancestorsMemo.size < 8192) this.ancestorsMemo.set(tip, seen);
     return seen;
@@ -363,8 +405,8 @@ export class Store {
       if (seen.has(oid)) continue;
       seen.add(oid);
       if (ancestorsA.has(oid)) return oid;
-      const object = this.objects.get(oid);
-      if (object && object.type === 'commit') queue.push(...parseCommit(object.data).parents);
+      const view = this.commitOf(oid);
+      if (view) queue.push(...view.parents);
     }
     return null;
   }
@@ -444,7 +486,7 @@ export function buildPack(store: Store, oids: Iterable<string>): Buffer {
     const object = store.objects.get(oid);
     if (!object) continue;
     parts.push(writePackHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    parts.push(deflateSync(object.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();

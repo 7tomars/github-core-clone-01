@@ -74,6 +74,9 @@ export function createApp(store = new Store()): Server {
   });
   server.keepAliveTimeout = 30_000;
   server.headersTimeout = 35_000;
+  // Small request/response ping-pong dominates the timed workloads; Nagle's
+  // algorithm only adds delay there.
+  server.on('connection', (socket) => socket.setNoDelay(true));
   return server;
 }
 
@@ -130,7 +133,9 @@ async function handle(store: Store, expectedToken: string, req: IncomingMessage,
     };
     const reply = handleRest(store, request);
     if (reply.rawText !== undefined) {
-      res.writeHead(reply.status, { 'x-github-request-id': nextRequestId() });
+      const headers: Record<string, string> = { 'x-github-request-id': nextRequestId() };
+      if (reply.contentType !== undefined) headers['content-type'] = reply.contentType;
+      res.writeHead(reply.status, headers);
       res.end(reply.rawText);
       return;
     }
